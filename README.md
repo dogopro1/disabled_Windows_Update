@@ -76,3 +76,4 @@ MIT – Free to use and modify.
 ---
 
 > **Have a nice no-updating day!**
+tested on win11 24h2
