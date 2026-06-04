@@ -1,7 +1,17 @@
-# KILL WINDOWS UPDATE - FINAL VERSION
+# KILL WINDOWS UPDATE - FINAL VERSION (hardened)
 # Run as Administrator!
-# Compatible: Windows 11 24H2
+# Compatible: Windows 11 24H2 (and broadly 10/11)
 # Method: Service disable + Registry lock + ACL ownership + Task disable + WSUS redirect + Rename protection
+#
+# CHANGES vs original (oznaczone w kodzie jako [ZMIANA]):
+#   - Twardy check uprawnien administratora (skrypt nie udaje juz sukcesu bez elewacji)
+#   - C:\Windows zastapione przez $env:windir / $env:SystemRoot (dziala na kazdej literze/sciezce)
+#   - Wykrycie edycji Windows + ostrzezenie, ze polityki WSUS/GPO sa na Home ignorowane
+#   - Rename plikow: proba na zywo, a przy zablokowanym pliku -> kolejka na nastepny boot
+#   - Run-Cmdlet: rzetelny raport OK/ERROR (lokalne ErrorAction=Stop zamiast zawodnego $?)
+#   - Zapisanie i przywrocenie koloru konsoli
+#   - Bezpieczne ReadKey (nie wywala sie w trybie nieinteraktywnym/ISE/zdalnym)
+#   - cryptsvc NIE jest juz trwale wylaczane (patrz komentarz przy sekcji 2 i 9)
 
 Write-Host "designed by" -ForegroundColor White
 Write-Host @"
@@ -13,11 +23,56 @@ Write-Host @"
                           
 "@ -ForegroundColor Blue
 
-$Host.UI.RawUI.ForegroundColor = "Gray"
+# ─────────────────────────────────────────────
+# [ZMIANA] HARD CHECK: wymagane uprawnienia administratora
+# Bez tego skrypt po cichu nic nie robi, a i tak wypisuje "DISABLED".
+# ─────────────────────────────────────────────
+$identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
+    Write-Host "`n[!] Ten skrypt wymaga uprawnien administratora." -ForegroundColor Red
+    Write-Host "    Uruchom PowerShell jako Administrator i odpal ponownie.`n" -ForegroundColor Yellow
+    if ($Host.Name -eq 'ConsoleHost' -and -not [System.Console]::IsInputRedirected) {
+        Write-Host "Nacisnij dowolny klawisz, aby zakonczyc..."
+        [void][System.Console]::ReadKey($true)
+    }
+    exit 1
+}
 
 $ErrorActionPreference = "SilentlyContinue"
+
+# [ZMIANA] Zapamietaj kolor konsoli, zeby przywrocic go na koncu
+$origColor = $Host.UI.RawUI.ForegroundColor
+$Host.UI.RawUI.ForegroundColor = "Gray"
+
 $script:results = @()
 $script:errors  = @()
+
+# ─────────────────────────────────────────────
+# [ZMIANA] Sciezki systemowe liczone dynamicznie.
+# Nigdzie nie zakladamy ze Windows jest na C:\Windows.
+# ─────────────────────────────────────────────
+$winDir = $env:windir          # np. C:\Windows
+if (-not $winDir) { $winDir = $env:SystemRoot }
+$sys32  = Join-Path $winDir "System32"
+$tasks  = Join-Path $sys32  "Tasks"
+
+# ─────────────────────────────────────────────
+# [ZMIANA] PREFLIGHT: wykrycie edycji Windows.
+# Polityki WSUS/GPO (sekcje 4 i 5) sa honorowane TYLKO na
+# Pro / Enterprise / Education. Edycja Home je ignoruje,
+# wiec na Home zadzialaja tylko: wylaczenie uslug, zadan,
+# zmiana nazw plikow i czyszczenie cache.
+# ─────────────────────────────────────────────
+$os = $null
+try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch {}
+$caption = if ($os) { $os.Caption } else { "" }
+$isHome  = $caption -match 'Home'
+if ($isHome) {
+    Write-Host "`n[i] Wykryto edycje Windows Home ($caption)." -ForegroundColor Yellow
+    Write-Host "    Polityki WSUS/GPO (sekcje 4 i 5) sa na Home ignorowane przez system." -ForegroundColor Yellow
+    Write-Host "    Zadzialaja: wylaczenie uslug, zadan i zmiana nazw plikow.`n" -ForegroundColor Yellow
+}
 
 # ─────────────────────────────────────────────
 # HELPER: Run a native command (uses $LASTEXITCODE)
@@ -42,19 +97,22 @@ function Run-Native {
 }
 
 # ─────────────────────────────────────────────
-# HELPER: Run a PowerShell cmdlet (uses $?)
+# HELPER: Run a PowerShell cmdlet
+# [ZMIANA] Sukces opieramy na braku wyjatku przy lokalnym
+# ErrorAction=Stop, nie na zawodnym $? (ktore przy globalnym
+# SilentlyContinue potrafilo raportowac falszywe "OK").
 # ─────────────────────────────────────────────
 function Run-Cmdlet {
     param([string]$label, [scriptblock]$block)
+    $old = $ErrorActionPreference
     try {
+        $ErrorActionPreference = 'Stop'
         & $block 2>&1 | Out-Null
-        if ($?) {
-            $script:results += "OK: $label"
-        } else {
-            $script:errors += "FAILED: $label"
-        }
+        $script:results += "OK: $label"
     } catch {
         $script:errors += "ERROR: $label -> $($_.Exception.Message)"
+    } finally {
+        $ErrorActionPreference = $old
     }
 }
 
@@ -167,6 +225,13 @@ public class TokenPriv {
 
 # ─────────────────────────────────────────────
 # HELPER: Rename a file by taking ownership first
+# [ZMIANA] Jesli plik jest zaladowany do pamieci (czesty
+# przypadek wuaueng.dll), Rename-Item na zywo padnie. Wtedy
+# kolejkujemy zmiane nazwy na nastepny start systemu przez
+# PendingFileRenameOperations (wykonuje ja Session Manager
+# zanim plik zostanie zablokowany). Dopisujemy do istniejacej
+# kolejki, zeby nie skasowac operacji zakolejkowanych przez
+# inne instalatory.
 # ─────────────────────────────────────────────
 function Rename-Protected {
     param([string]$FullPath, [string]$NewName)
@@ -174,12 +239,27 @@ function Rename-Protected {
     try {
         Run-Native "takeown /f `"$FullPath`" /a"
         Run-Native "icacls `"$FullPath`" /grant *S-1-5-32-544:F"
-        $dest = Join-Path (Split-Path $FullPath) $NewName
-        if (-not (Test-Path $dest)) {
+
+        $dir  = Split-Path $FullPath
+        $dest = Join-Path $dir $NewName
+
+        if (Test-Path $dest) {
+            $script:results += "SKIP (already renamed): $label"
+            return
+        }
+
+        try {
+            # Proba zmiany nazwy na zywym systemie
             Rename-Item -Path $FullPath -NewName $NewName -Force -ErrorAction Stop
             $script:results += "OK: $label"
-        } else {
-            $script:results += "SKIP (already renamed): $label"
+        } catch {
+            # Plik prawdopodobnie w uzyciu -> kolejka na nastepny boot
+            $smPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+            $cur = (Get-ItemProperty -Path $smPath -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+            if (-not $cur) { $cur = @() }
+            $cur = @($cur) + "\??\$FullPath" + "\??\$dest"
+            Set-ItemProperty -Path $smPath -Name PendingFileRenameOperations -Value $cur -Type MultiString -Force -ErrorAction Stop
+            $script:results += "QUEUED (rename on next reboot): $label"
         }
     } catch {
         $script:errors += "ERROR: $label -> $($_.Exception.Message)"
@@ -191,6 +271,8 @@ function Rename-Protected {
 # ════════════════════════════════════════════════
 Write-Host "`nStopping Windows Update services..." -ForegroundColor Cyan
 
+# cryptsvc jest zatrzymywany TYMCZASOWO, zeby odblokowac catroot2 (sekcja 9).
+# Po skrypcie wystartuje ponownie i odbuduje catroot2 (patrz sekcja 2/9).
 $servicesToStop = @("wuauserv","bits","dosvc","WaaSMedicSvc","cryptsvc","usosvc")
 foreach ($svc in $servicesToStop) {
     # Exit code 2 = service not running (already stopped) — not a real failure
@@ -202,7 +284,19 @@ foreach ($svc in $servicesToStop) {
 # ════════════════════════════════════════════════
 Write-Host "`nDisabling services via sc config..." -ForegroundColor Cyan
 
-$servicesToDisable = @("wuauserv","bits","cryptsvc","usosvc")
+# [ZMIANA] cryptsvc USUNIETE z trwalego wylaczania.
+# Powod: catroot2 (sekcja 9) to baza katalogow .cat uzywana przez
+# Cryptographic Services do weryfikacji PODPISOW W CALYM SYSTEMIE
+# (instalacja sterownikow, czesc instalatorow). System odbudowuje
+# catroot2 dopiero gdy cryptsvc wystartuje. Trwale wylaczenie cryptsvc
+# + skasowanie catroot2 = brak mozliwosci odbudowy -> ryzyko problemow
+# z podpisami/sterownikami. cryptsvc nie jest mechanizmem Windows Update,
+# wiec pozostawienie go wlaczonego NIE oslabia blokady aktualizacji.
+#
+# Jesli mimo to chcesz cryptsvc trwale wylaczyc, dodaj go z powrotem:
+#   $servicesToDisable = @("wuauserv","bits","cryptsvc","usosvc")
+# (licz sie wtedy z mozliwymi bledami weryfikacji podpisow).
+$servicesToDisable = @("wuauserv","bits","usosvc")
 foreach ($svc in $servicesToDisable) {
     Run-Native "sc.exe config $svc start= disabled"
 }
@@ -230,6 +324,7 @@ Set-RegistryOwnerAndWrite -KeyPath "SYSTEM\CurrentControlSet\Services\UsoSvc" `
 #    Points Windows Update to a dummy local WSUS
 #    server so it cannot phone home even if a
 #    service somehow restarts.
+#    (Uwaga: dziala tylko na Pro/Enterprise/Education.)
 # ════════════════════════════════════════════════
 Write-Host "`nRedirecting Windows Update to dummy WSUS server..." -ForegroundColor Cyan
 
@@ -255,6 +350,7 @@ Run-Cmdlet "Set UseWUServer = 1" {
 
 # ════════════════════════════════════════════════
 # 5. REGISTRY POLICIES — BLOCK UPDATES
+#    (Uwaga: te polityki dzialaja tylko na Pro/Enterprise/Education.)
 # ════════════════════════════════════════════════
 Write-Host "`nApplying registry policies to block updates..." -ForegroundColor Cyan
 
@@ -297,25 +393,28 @@ foreach ($task in $schedTasks) {
 #    Windows Resource Protection cannot restore a
 #    renamed file without SFC /scannow, which the
 #    user controls.
+#    [ZMIANA] Sciezki przez $sys32; rename z fallbackiem na boot.
 # ════════════════════════════════════════════════
 Write-Host "`nRenaming Windows Update executables..." -ForegroundColor Cyan
 
-if (Test-Path "C:\Windows\System32\wuaueng.dll") {
-    Rename-Protected "C:\Windows\System32\wuaueng.dll" "wuaueng.dll.bak"
-}
-if (Test-Path "C:\Windows\System32\usoclient.exe") {
-    Rename-Protected "C:\Windows\System32\usoclient.exe" "usoclient.exe.bak"
-}
+$wuaueng   = Join-Path $sys32 "wuaueng.dll"
+$usoclient = Join-Path $sys32 "usoclient.exe"
+
+if (Test-Path $wuaueng)   { Rename-Protected $wuaueng   "wuaueng.dll.bak" }
+if (Test-Path $usoclient) { Rename-Protected $usoclient "usoclient.exe.bak" }
 
 # ════════════════════════════════════════════════
 # 8. RENAME SCHEDULED TASK FOLDERS
+#    [ZMIANA] Sciezki przez $tasks. (Uwaga: definicje zadan
+#    istnieja rownolegle w rejestrze pod TaskCache — to celowo
+#    agresywny krok; sekcja 6 i tak juz te zadania wylaczyla.)
 # ════════════════════════════════════════════════
 Write-Host "`nRenaming task folders..." -ForegroundColor Cyan
 
 $taskFolders = @(
-    "C:\Windows\System32\Tasks\Microsoft\Windows\UpdateOrchestrator",
-    "C:\Windows\System32\Tasks\Microsoft\Windows\WindowsUpdate",
-    "C:\Windows\System32\Tasks\Microsoft\Windows\WaaSMedic"
+    (Join-Path $tasks "Microsoft\Windows\UpdateOrchestrator"),
+    (Join-Path $tasks "Microsoft\Windows\WindowsUpdate"),
+    (Join-Path $tasks "Microsoft\Windows\WaaSMedic")
 )
 foreach ($folder in $taskFolders) {
     $oldName = Split-Path $folder -Leaf
@@ -329,12 +428,14 @@ foreach ($folder in $taskFolders) {
 
 # ════════════════════════════════════════════════
 # 9. CLEAR WINDOWS UPDATE CACHE
+#    [ZMIANA] Sciezki przez $winDir/$sys32. catroot2 odbuduje sie
+#    automatycznie, bo cryptsvc pozostaje wlaczony (patrz sekcja 2).
 # ════════════════════════════════════════════════
 Write-Host "`nClearing Windows Update cache folders..." -ForegroundColor Cyan
 
 $cacheFolders = @(
-    "C:\Windows\SoftwareDistribution",
-    "C:\Windows\System32\catroot2"
+    (Join-Path $winDir "SoftwareDistribution"),
+    (Join-Path $sys32  "catroot2")
 )
 foreach ($folder in $cacheFolders) {
     if (Test-Path $folder) {
@@ -367,6 +468,18 @@ if ($script:errors.Count -gt 0) {
     $script:errors | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
 }
 
+# [ZMIANA] Informacja jesli cokolwiek zostalo zakolejkowane na reboot
+if ($script:results | Where-Object { $_ -like 'QUEUED*' }) {
+    Write-Host "`n[i] Czesc zmian nazw plikow wykona sie po RESTARCIE systemu." -ForegroundColor Yellow
+}
+
 Write-Host "`nHave a nice no-updating day!" -ForegroundColor Magenta
-Write-Host "`nPress any key to exit..."
-[void][System.Console]::ReadKey($true)
+
+# [ZMIANA] Przywroc oryginalny kolor konsoli
+$Host.UI.RawUI.ForegroundColor = $origColor
+
+# [ZMIANA] Bezpieczne ReadKey — tylko gdy jest realna konsola interaktywna
+if ($Host.Name -eq 'ConsoleHost' -and -not [System.Console]::IsInputRedirected) {
+    Write-Host "`nPress any key to exit..."
+    [void][System.Console]::ReadKey($true)
+}
